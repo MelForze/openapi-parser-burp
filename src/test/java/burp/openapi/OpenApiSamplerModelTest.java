@@ -19,6 +19,8 @@ import org.junit.jupiter.api.Test;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -424,6 +426,88 @@ final class OpenApiSamplerModelTest
         assertEquals(2, model.filter("", "http://127.0.0.1:18080").size());
         assertTrue(model.operations().stream()
                 .allMatch(operation -> operation.servers().equals(List.of("http://127.0.0.1:18080"))));
+    }
+
+    @Test
+    void operationsAccessorReturnsImmutableSnapshotNotLiveView()
+    {
+        OpenApiSamplerModel model = new OpenApiSamplerModel();
+        model.load(singleGetSpec("https://api.one.test", "/a", "a", "A"), "https://api.one.test/openapi.json");
+
+        List<OpenApiSamplerModel.OperationContext> snapshot = model.operations();
+        int sizeBefore = snapshot.size();
+
+        // A previously returned list must not change when the model is mutated afterwards, otherwise a
+        // worker thread iterating it can hit ConcurrentModificationException while the EDT loads a spec.
+        model.load(singleGetSpec("https://api.two.test", "/b", "b", "B"), "https://api.two.test/openapi.json");
+
+        assertEquals(sizeBefore, snapshot.size());
+        assertEquals(2, model.operations().size());
+    }
+
+    @Test
+    void concurrentReadsAndLoadsDoNotThrow() throws Exception
+    {
+        OpenApiSamplerModel model = new OpenApiSamplerModel();
+        model.load(singleGetSpec("https://seed.test", "/seed", "seed", "Seed"), "https://seed.test/openapi.json");
+
+        AtomicReference<Throwable> error = new AtomicReference<>();
+        AtomicBoolean stop = new AtomicBoolean(false);
+
+        Thread writer = new Thread(() -> {
+            int i = 0;
+            while (!stop.get() && error.get() == null)
+            {
+                try
+                {
+                    int bucket = i % 5;
+                    model.load(singleGetSpec("https://w.test/" + bucket, "/p" + bucket, "op" + bucket, "S"),
+                            "https://w.test/" + bucket + "/openapi.json");
+                    if (i % 50 == 0)
+                    {
+                        model.clear();
+                    }
+                    i++;
+                }
+                catch (Throwable t)
+                {
+                    error.set(t);
+                }
+            }
+        });
+
+        Thread reader = new Thread(() -> {
+            while (!stop.get() && error.get() == null)
+            {
+                try
+                {
+                    for (OpenApiSamplerModel.OperationContext op : model.operations())
+                    {
+                        op.path();
+                    }
+                    model.availableServers().forEach(String::length);
+                    model.availableServers("missing").size();
+                    model.availableSources().size();
+                    model.filter("", "(Operation default)", "");
+                }
+                catch (Throwable t)
+                {
+                    error.set(t);
+                }
+            }
+        });
+
+        writer.start();
+        reader.start();
+        Thread.sleep(250L);
+        stop.set(true);
+        writer.join(2000L);
+        reader.join(2000L);
+
+        if (error.get() != null)
+        {
+            throw new AssertionError("concurrent model access threw: " + error.get(), error.get());
+        }
     }
 
     private OpenAPI singleGetSpec(String server, String path, String operationId, String summary)

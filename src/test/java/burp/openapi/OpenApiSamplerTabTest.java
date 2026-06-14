@@ -32,11 +32,14 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -44,6 +47,7 @@ import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -303,6 +307,26 @@ final class OpenApiSamplerTabTest
     }
 
     @Test
+    void authSecretIsNeverPersistedAndIsScrubbed() throws Exception
+    {
+        TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(ctx.api);
+        JTextField authKeyField = (JTextField) field(tab, "authKeyField");
+        JTextField authValueField = (JTextField) field(tab, "authValueField");
+
+        // Simulate a secret already written to the (unencrypted) project store by an older version.
+        ctx.extensionData.setString("ui.authValue", "super-secret-token");
+        authKeyField.setText("X-API-Key");
+        authValueField.setText("super-secret-token");
+
+        invoke(tab, "persistUiState", new Class<?>[]{});
+
+        // Non-secret prefs are kept; the secret value is never written and any old value is scrubbed.
+        assertEquals("X-API-Key", ctx.extensionData.getString("ui.authKey"));
+        assertNull(ctx.extensionData.getString("ui.authValue"));
+    }
+
+    @Test
     void exportDocumentIncludesSourceAndAllFormats() throws Exception
     {
         TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
@@ -343,6 +367,86 @@ final class OpenApiSamplerTabTest
         assertTrue(tooMany);
         assertFalse(canceled);
         assertFalse(badRequest);
+    }
+
+    @Test
+    void specDiscoveryDoesNotFollowCrossHostReferences() throws Exception
+    {
+        AtomicBoolean crossHostFetched = new AtomicBoolean(false);
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(
+                TestApiFactory.apiContext().api,
+                (url, responseTimeoutMs, perAttemptDeadlineMs, followRedirects) -> {
+                    if (url.contains("b.example"))
+                    {
+                        crossHostFetched.set(true);
+                        return fetchResponse(minimalJsonSpec("Cross", "/cross"));
+                    }
+                    // A Swagger UI page on the entered host that points its spec at a different host.
+                    byte[] html = "<script>SwaggerUIBundle({configUrl:\"https://b.example/openapi.json\"})</script>"
+                            .getBytes(StandardCharsets.UTF_8);
+                    return new OpenApiSamplerTab.FetchResponse((short) 200, html, "text/html", html.length);
+                }
+        );
+
+        // Discovery must stay on the entered host, so no a.example spec is found and no b.example fetch happens.
+        assertThrows(IllegalStateException.class, () ->
+                invoke(tab, "fetchAndParseFromUrl", new Class<?>[]{String.class}, "https://a.example/docs"));
+        assertFalse(crossHostFetched.get(), "cross-host spec reference must not be fetched");
+    }
+
+    @Test
+    void cancelDuringInFlightFetchStopsPromptly() throws Exception
+    {
+        CountDownLatch fetchStarted = new CountDownLatch(1);
+        CountDownLatch releaseFetch = new CountDownLatch(1);
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(
+                TestApiFactory.apiContext().api,
+                (url, responseTimeoutMs, perAttemptDeadlineMs, followRedirects) -> {
+                    fetchStarted.countDown();
+                    // Simulate a slow/hung server: the request only ends if explicitly released.
+                    releaseFetch.await(10, TimeUnit.SECONDS);
+                    return fetchResponse(minimalJsonSpec("Late", "/late"));
+                }
+        );
+
+        AtomicReference<Throwable> caught = new AtomicReference<>();
+        CountDownLatch done = new CountDownLatch(1);
+        Thread fetchThread = new Thread(() -> {
+            try
+            {
+                invoke(tab, "fetchUrl", new Class<?>[]{String.class}, "https://hang.example/openapi.json");
+            }
+            catch (Throwable t)
+            {
+                caught.set(t);
+            }
+            finally
+            {
+                done.countDown();
+            }
+        });
+        fetchThread.setDaemon(true);
+
+        try
+        {
+            fetchThread.start();
+            assertTrue(fetchStarted.await(2, TimeUnit.SECONDS));
+
+            // User clicks "Cancel load" while the request is still in flight.
+            setField(tab, "loadingInProgress", true);
+            invoke(tab, "requestCancelUrlListLoad", new Class<?>[]{});
+
+            // The in-flight fetch must be abandoned promptly, not blocked for the full deadline.
+            assertTrue(done.await(2, TimeUnit.SECONDS), "fetch should stop promptly after cancel");
+            assertNotNull(caught.get());
+            String message = caught.get().getMessage();
+            assertTrue(message != null && message.toLowerCase().contains("cancel"),
+                    "expected a cancellation error, got: " + caught.get());
+        }
+        finally
+        {
+            releaseFetch.countDown();
+        }
     }
 
     @Test
@@ -430,21 +534,35 @@ final class OpenApiSamplerTabTest
     }
 
     @Test
-    void autoIncludeSpecHostInScopeIncludesWhenMissingAndSkipsWhenAlreadyInScope() throws Exception
+    void scopeIsNeverModifiedWhenSendingToScan() throws Exception
     {
         TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
         OpenApiSamplerTab tab = new OpenApiSamplerTab(ctx.api);
+        OpenApiSamplerModel model = (OpenApiSamplerModel) field(tab, "model");
+        model.load(spec("https://scan.example", "/users"), "https://scan.example/openapi.json");
 
-        when(ctx.scope.isInScope("https://api.example/")).thenReturn(false);
-        invoke(tab, "autoIncludeSpecHostInScope", new Class<?>[]{String.class}, "https://api.example/openapi.json");
-        verify(ctx.scope).includeInScope("https://api.example/");
+        Audit audit = mock(Audit.class);
+        CountDownLatch latch = new CountDownLatch(1);
+        when(ctx.scanner.startAudit(any())).thenReturn(audit);
+        when(audit.statusMessage()).thenReturn("running");
+        when(audit.requestCount()).thenReturn(0);
+        doAnswer(invocation -> {
+            latch.countDown();
+            return null;
+        }).when(audit).addRequest(any(HttpRequest.class));
 
-        when(ctx.scope.isInScope("https://already.example/")).thenReturn(true);
-        invoke(tab, "autoIncludeSpecHostInScope", new Class<?>[]{String.class}, "https://already.example/openapi.json");
-        verify(ctx.scope, never()).includeInScope("https://already.example/");
+        invoke(
+                tab,
+                "onSelectionAction",
+                new Class<?>[]{OpenApiSamplerTable.SelectionAction.class, List.class},
+                OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
+                List.of(model.operations().get(0))
+        );
+        assertTrue(latch.await(2, TimeUnit.SECONDS));
 
-        invoke(tab, "autoIncludeSpecHostInScope", new Class<?>[]{String.class}, "file:/tmp/openapi.yaml");
-        verify(ctx.scope, never()).includeInScope("file:/tmp/");
+        // N1: the extension must never silently change the user's Burp scope.
+        verify(ctx.scope, never()).includeInScope(any(String.class));
+        verify(ctx.scope, never()).isInScope(any(String.class));
     }
 
     @Test
@@ -645,7 +763,7 @@ final class OpenApiSamplerTabTest
         );
 
         Repeater repeater = ctx.repeater;
-        verify(repeater, times(2)).sendToRepeater(any(HttpRequest.class), contains("OpenAPI Sampler / All /"));
+        verify(repeater, timeout(2000).times(2)).sendToRepeater(any(HttpRequest.class), contains("OpenAPI Sampler / All /"));
     }
 
     @Test
@@ -664,26 +782,37 @@ final class OpenApiSamplerTabTest
                 List.of(model.operations().get(0))
         );
 
-        verify(ctx.intruder, times(1)).sendToIntruder(any(HttpRequest.class));
+        verify(ctx.intruder, timeout(2000).times(1)).sendToIntruder(any(HttpRequest.class));
     }
 
     @Test
-    void activeScanTaskIsCreatedOnceAndReusedOnSecondSend() throws Exception
+    void scanTaskIsCreatedFreshForEachSendSoDeletedTasksAreReplaced() throws Exception
     {
         TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
         OpenApiSamplerTab tab = new OpenApiSamplerTab(ctx.api);
         OpenApiSamplerModel model = (OpenApiSamplerModel) field(tab, "model");
         model.load(spec("https://scan.example", "/users"), "https://scan.example/openapi.json");
 
-        Audit audit = mock(Audit.class);
-        CountDownLatch latch = new CountDownLatch(2);
-        when(ctx.scanner.startAudit(any())).thenReturn(audit);
-        when(audit.statusMessage()).thenReturn("running");
-        when(audit.requestCount()).thenReturn(0);
+        Audit firstTask = mock(Audit.class);
+        Audit secondTask = mock(Audit.class);
+        CountDownLatch firstLatch = new CountDownLatch(1);
+        CountDownLatch secondLatch = new CountDownLatch(1);
+        when(ctx.scanner.startAudit(any())).thenReturn(firstTask, secondTask);
+        // After the user deletes a scan task in Burp, the cached Audit handle stays "silent":
+        // statusMessage()/requestCount() do not throw and addRequest() becomes a no-op. The old
+        // code reused that dead handle and the second send vanished with no scanner progress.
+        when(firstTask.statusMessage()).thenReturn("running");
+        when(firstTask.requestCount()).thenReturn(0);
+        when(secondTask.statusMessage()).thenReturn("running");
+        when(secondTask.requestCount()).thenReturn(0);
         doAnswer(invocation -> {
-            latch.countDown();
+            firstLatch.countDown();
             return null;
-        }).when(audit).addRequest(any(HttpRequest.class));
+        }).when(firstTask).addRequest(any(HttpRequest.class));
+        doAnswer(invocation -> {
+            secondLatch.countDown();
+            return null;
+        }).when(secondTask).addRequest(any(HttpRequest.class));
 
         invoke(
                 tab,
@@ -692,6 +821,8 @@ final class OpenApiSamplerTabTest
                 OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
                 List.of(model.operations().get(0))
         );
+        assertTrue(firstLatch.await(2, TimeUnit.SECONDS));
+
         invoke(
                 tab,
                 "onSelectionAction",
@@ -699,10 +830,11 @@ final class OpenApiSamplerTabTest
                 OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
                 List.of(model.operations().get(0))
         );
+        assertTrue(secondLatch.await(2, TimeUnit.SECONDS));
 
-        assertTrue(latch.await(2, TimeUnit.SECONDS));
-        verify(ctx.scanner, times(1)).startAudit(any());
-        verify(audit, times(2)).addRequest(any(HttpRequest.class));
+        verify(ctx.scanner, times(2)).startAudit(any());
+        verify(firstTask, times(1)).addRequest(any(HttpRequest.class));
+        verify(secondTask, times(1)).addRequest(any(HttpRequest.class));
     }
 
     @Test
@@ -833,7 +965,7 @@ final class OpenApiSamplerTabTest
 
         Audit activeAudit = mock(Audit.class);
         Audit passiveAudit = mock(Audit.class);
-        CountDownLatch activeLatch = new CountDownLatch(2);
+        CountDownLatch activeLatch = new CountDownLatch(1);
         CountDownLatch passiveLatch = new CountDownLatch(1);
 
         when(ctx.scanner.startAudit(any())).thenReturn(activeAudit, passiveAudit);
@@ -857,6 +989,8 @@ final class OpenApiSamplerTabTest
                 OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
                 List.of(model.operations().get(0))
         );
+        assertTrue(activeLatch.await(2, TimeUnit.SECONDS));
+
         invoke(
                 tab,
                 "onSelectionAction",
@@ -864,6 +998,32 @@ final class OpenApiSamplerTabTest
                 OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_PASSIVE_SCAN,
                 List.of(model.operations().get(0))
         );
+        assertTrue(passiveLatch.await(2, TimeUnit.SECONDS));
+
+        verify(ctx.scanner, times(2)).startAudit(any());
+        verify(activeAudit, times(1)).addRequest(any(HttpRequest.class));
+        verify(passiveAudit, times(1)).addRequest(any(HttpRequest.class));
+    }
+
+    @Test
+    void disposeShutsDownExecutorAndLeavesScanTasksIntact() throws Exception
+    {
+        TestApiFactory.ApiContext ctx = TestApiFactory.apiContext();
+        OpenApiSamplerTab tab = new OpenApiSamplerTab(ctx.api);
+        OpenApiSamplerModel model = (OpenApiSamplerModel) field(tab, "model");
+        model.load(spec("https://scan.example", "/users"), "https://scan.example/openapi.json");
+        ExecutorService workerPool = (ExecutorService) field(tab, "workerPool");
+
+        Audit audit = mock(Audit.class);
+        CountDownLatch latch = new CountDownLatch(1);
+        when(ctx.scanner.startAudit(any())).thenReturn(audit);
+        when(audit.statusMessage()).thenReturn("running");
+        when(audit.requestCount()).thenReturn(0);
+        doAnswer(invocation -> {
+            latch.countDown();
+            return null;
+        }).when(audit).addRequest(any(HttpRequest.class));
+
         invoke(
                 tab,
                 "onSelectionAction",
@@ -871,30 +1031,14 @@ final class OpenApiSamplerTabTest
                 OpenApiSamplerTable.SelectionAction.SEND_SELECTED_TO_ACTIVE_SCAN,
                 List.of(model.operations().get(0))
         );
-
-        assertTrue(activeLatch.await(2, TimeUnit.SECONDS));
-        assertTrue(passiveLatch.await(2, TimeUnit.SECONDS));
-        verify(ctx.scanner, times(2)).startAudit(any());
-        verify(activeAudit, times(2)).addRequest(any(HttpRequest.class));
-        verify(passiveAudit, times(1)).addRequest(any(HttpRequest.class));
-    }
-
-    @Test
-    void disposeShutsDownExecutorAndIsIdempotent() throws Exception
-    {
-        OpenApiSamplerTab tab = new OpenApiSamplerTab(TestApiFactory.apiContext().api);
-        ExecutorService workerPool = (ExecutorService) field(tab, "workerPool");
-        Audit activeAudit = mock(Audit.class);
-        Audit passiveAudit = mock(Audit.class);
-        setField(tab, "activeAuditTask", activeAudit);
-        setField(tab, "passiveAuditTask", passiveAudit);
+        assertTrue(latch.await(2, TimeUnit.SECONDS));
 
         tab.dispose();
         tab.dispose();
 
         assertTrue(workerPool.isShutdown());
-        verify(activeAudit, times(1)).delete();
-        verify(passiveAudit, times(1)).delete();
+        // Unloading the extension must not destroy the user's scan task (it holds scan results).
+        verify(audit, never()).delete();
     }
 
     @Test

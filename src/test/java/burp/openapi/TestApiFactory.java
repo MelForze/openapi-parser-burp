@@ -89,6 +89,10 @@ final class TestApiFactory
             }
             return null;
         }).when(extensionData).setString(anyString(), anyString());
+        doAnswer(invocation -> {
+            persistedStrings.remove(invocation.<String>getArgument(0));
+            return null;
+        }).when(extensionData).deleteString(anyString());
 
         return new ApiContext(
                 api,

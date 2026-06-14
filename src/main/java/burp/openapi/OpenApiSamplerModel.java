@@ -14,7 +14,6 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -35,27 +34,29 @@ public final class OpenApiSamplerModel
     private final LinkedHashMap<String, SourceContext> sources = new LinkedHashMap<>();
     private final LinkedHashMap<String, LinkedHashSet<String>> serversBySource = new LinkedHashMap<>();
 
-    public OpenAPI openAPI()
+    public synchronized OpenAPI openAPI()
     {
         return openAPI;
     }
 
-    public String sourceLocation()
+    public synchronized String sourceLocation()
     {
         return sourceLocation;
     }
 
-    public List<OperationContext> operations()
+    public synchronized List<OperationContext> operations()
     {
-        return Collections.unmodifiableList(operations);
+        // Return an immutable snapshot (not a live view): callers on worker threads must be able to
+        // iterate the result safely even while the EDT mutates the model via load()/replaceServer().
+        return List.copyOf(operations);
     }
 
-    public List<String> availableServers()
+    public synchronized List<String> availableServers()
     {
-        return Collections.unmodifiableList(availableServers);
+        return List.copyOf(availableServers);
     }
 
-    public List<String> availableServers(String selectedSourceId)
+    public synchronized List<String> availableServers(String selectedSourceId)
     {
         if (Utils.isBlank(selectedSourceId))
         {
@@ -70,12 +71,12 @@ public final class OpenApiSamplerModel
         return List.copyOf(scoped);
     }
 
-    public List<SourceContext> availableSources()
+    public synchronized List<SourceContext> availableSources()
     {
         return List.copyOf(sources.values());
     }
 
-    public int removeOperations(Collection<OperationContext> toRemove)
+    public synchronized int removeOperations(Collection<OperationContext> toRemove)
     {
         if (toRemove == null || toRemove.isEmpty())
         {
@@ -88,7 +89,7 @@ public final class OpenApiSamplerModel
         return before - operations.size();
     }
 
-    public int replaceServer(Collection<OperationContext> selectedOperations, String server)
+    public synchronized int replaceServer(Collection<OperationContext> selectedOperations, String server)
     {
         String normalizedServer = Utils.stripTrailingSlash(Utils.coalesce(server));
         if (selectedOperations == null || selectedOperations.isEmpty() || Utils.isBlank(normalizedServer))
@@ -117,7 +118,7 @@ public final class OpenApiSamplerModel
         return updated;
     }
 
-    public void clear()
+    public synchronized void clear()
     {
         openAPI = null;
         sourceLocation = null;
@@ -127,12 +128,12 @@ public final class OpenApiSamplerModel
         serversBySource.clear();
     }
 
-    public void load(OpenAPI parsedOpenApi, String source)
+    public synchronized void load(OpenAPI parsedOpenApi, String source)
     {
         load(parsedOpenApi, source, source);
     }
 
-    public void load(OpenAPI parsedOpenApi, String source, String sourceLabel)
+    public synchronized void load(OpenAPI parsedOpenApi, String source, String sourceLabel)
     {
         Objects.requireNonNull(parsedOpenApi, "parsedOpenApi must not be null");
 
@@ -285,17 +286,17 @@ public final class OpenApiSamplerModel
                 + operationContext.serversAsString();
     }
 
-    public List<OperationContext> filter(String query)
+    public synchronized List<OperationContext> filter(String query)
     {
         return filter(query, null, null);
     }
 
-    public List<OperationContext> filter(String query, String selectedServer)
+    public synchronized List<OperationContext> filter(String query, String selectedServer)
     {
         return filter(query, selectedServer, null);
     }
 
-    public List<OperationContext> filter(String query, String selectedServer, String selectedSourceId)
+    public synchronized List<OperationContext> filter(String query, String selectedServer, String selectedSourceId)
     {
         final String normalized = Utils.safeLower(query).trim();
         final boolean filterByServer = Utils.nonBlank(selectedServer) && !"(Operation default)".equals(selectedServer);

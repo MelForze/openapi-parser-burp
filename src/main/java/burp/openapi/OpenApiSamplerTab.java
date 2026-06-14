@@ -31,7 +31,6 @@ import javax.swing.JLabel;
 import javax.swing.JMenuItem;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
-import javax.swing.JScrollPane;
 import javax.swing.JSplitPane;
 import javax.swing.JTextField;
 import javax.swing.SwingUtilities;
@@ -59,12 +58,10 @@ import java.util.Deque;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -92,6 +89,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
     private static final int MAX_CONCURRENT_URL_FETCHES = 1;
     private static final long RESPONSE_TIMEOUT_MS = 25_000L;
     private static final long PER_ATTEMPT_DEADLINE_MS = 30_000L;
+    private static final long CANCEL_POLL_INTERVAL_MS = 150L;
     private static final int MAX_SPEC_SIZE_BYTES = 5 * 1024 * 1024;
     private static final String STATE_URL_FIELD = "ui.urlField";
     private static final String STATE_FILTER_FIELD = "ui.filterField";
@@ -137,16 +135,12 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
     private final JLabel responsePreviewLabel;
     private final HttpResponseEditor responsePreviewEditor;
     private final JLabel failedSummaryLabel;
-    private final Set<String> autoIncludedHosts = ConcurrentHashMap.newKeySet();
     private final List<String> lastLoadFailures = new CopyOnWriteArrayList<>();
-    private final Object auditLock = new Object();
     private final AtomicBoolean disposed = new AtomicBoolean(false);
     private final Timer filterDebounceTimer;
 
     private volatile boolean loadingInProgress;
     private volatile boolean cancelRequested;
-    private volatile Audit activeAuditTask;
-    private volatile Audit passiveAuditTask;
     private String restoredSourceId = "";
     private String restoredServer = "";
     private List<String> restoredSourceLocations = List.of();
@@ -382,8 +376,8 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         cancelRequested = true;
         loadingInProgress = false;
         filterDebounceTimer.stop();
-        deleteAuditTasks();
-        autoIncludedHosts.clear();
+        // Intentionally do NOT delete the user's scan tasks here: unloading the extension must leave
+        // their running/finished Active/Passive scans (and results) intact in the Burp dashboard.
         lastLoadFailures.clear();
 
         workerPool.shutdown();
@@ -415,33 +409,6 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         catch (Exception ignored)
         {
             // Best-effort cleanup; unload should proceed even if UI teardown fails.
-        }
-    }
-
-    private void deleteAuditTasks()
-    {
-        synchronized (auditLock)
-        {
-            deleteAuditTask(activeAuditTask);
-            deleteAuditTask(passiveAuditTask);
-            activeAuditTask = null;
-            passiveAuditTask = null;
-        }
-    }
-
-    private void deleteAuditTask(Audit auditTask)
-    {
-        if (auditTask == null)
-        {
-            return;
-        }
-        try
-        {
-            auditTask.delete();
-        }
-        catch (Exception ignored)
-        {
-            // Best-effort scanner task cleanup during unload.
         }
     }
 
@@ -668,6 +635,11 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             }
             catch (Exception ex)
             {
+                if (isCancellationError(ex))
+                {
+                    canceled = true;
+                    break;
+                }
                 String failure = url + " -> " + Utils.coalesce(ex.getMessage(), ex.getClass().getSimpleName());
                 failures.add(failure);
                 registerLoadFailure(url, Utils.coalesce(ex.getMessage(), ex.getClass().getSimpleName()));
@@ -884,11 +856,16 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
     {
         URI.create(normalizedUrl);
 
+        // Spec auto-discovery (Swagger UI configUrl/url fields and ?url= query params) may point to
+        // arbitrary hosts. Restrict every discovered candidate to the host the user actually entered,
+        // so loading one URL never fans out network traffic to a different host.
+        String allowedHost = hostOf(normalizedUrl);
+
         Deque<String> queue = new ArrayDeque<>();
         LinkedHashSet<String> seen = new LinkedHashSet<>();
         for (String candidate : buildCandidateSpecUrls(normalizedUrl))
         {
-            enqueueSpecCandidate(queue, seen, candidate);
+            enqueueSpecCandidate(queue, seen, candidate, allowedHost);
         }
 
         List<String> attemptErrors = new ArrayList<>();
@@ -896,6 +873,11 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
 
         while (!queue.isEmpty() && attempts < MAX_SPEC_FETCH_ATTEMPTS)
         {
+            if (cancelRequested || disposed.get())
+            {
+                throw new IOException("Canceled by user");
+            }
+
             String candidate = queue.removeFirst();
             attempts++;
 
@@ -919,7 +901,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
                     int newlyQueued = 0;
                     for (String referenced : discovered)
                     {
-                        if (enqueueSpecCandidate(queue, seen, referenced))
+                        if (enqueueSpecCandidate(queue, seen, referenced, allowedHost))
                         {
                             newlyQueued++;
                         }
@@ -974,12 +956,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
 
             try
             {
-                FetchResponse response = specFetcher.fetch(
-                        candidateUrl,
-                        RESPONSE_TIMEOUT_MS,
-                        PER_ATTEMPT_DEADLINE_MS,
-                        true
-                );
+                FetchResponse response = fetchWithCancellation(candidateUrl);
                 if (response == null)
                 {
                     throw new IOException("network: no response received");
@@ -1043,6 +1020,58 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         throw lastError == null ? new IOException("Unknown fetch error") : lastError;
     }
 
+    /**
+     * Runs a single fetch on a daemon thread while polling the cancel flag, so that clicking
+     * "Cancel load" abandons an in-flight request promptly instead of blocking the worker until
+     * the per-attempt deadline (or the server) finally responds.
+     */
+    private FetchResponse fetchWithCancellation(String candidateUrl) throws Exception
+    {
+        FutureTask<FetchResponse> fetchTask = new FutureTask<>(() ->
+                specFetcher.fetch(candidateUrl, RESPONSE_TIMEOUT_MS, PER_ATTEMPT_DEADLINE_MS, true));
+        Thread fetchThread = new Thread(fetchTask, "openapi-sampler-fetch");
+        fetchThread.setDaemon(true);
+        fetchThread.start();
+
+        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(PER_ATTEMPT_DEADLINE_MS);
+        while (true)
+        {
+            if (cancelRequested || disposed.get())
+            {
+                fetchTask.cancel(true);
+                throw new IOException("Canceled by user");
+            }
+
+            try
+            {
+                return fetchTask.get(CANCEL_POLL_INTERVAL_MS, TimeUnit.MILLISECONDS);
+            }
+            catch (TimeoutException pollTimeout)
+            {
+                if (System.nanoTime() >= deadlineNanos)
+                {
+                    fetchTask.cancel(true);
+                    throw new IOException("timeout: attempt deadline exceeded (" + PER_ATTEMPT_DEADLINE_MS + " ms)", pollTimeout);
+                }
+            }
+            catch (InterruptedException interruptedException)
+            {
+                fetchTask.cancel(true);
+                Thread.currentThread().interrupt();
+                throw new IOException("timeout: interrupted while waiting for response", interruptedException);
+            }
+            catch (ExecutionException executionException)
+            {
+                Throwable cause = executionException.getCause();
+                if (cause instanceof Exception ex)
+                {
+                    throw ex;
+                }
+                throw new IOException("network: " + executionException.getMessage(), executionException);
+            }
+        }
+    }
+
     private FetchResponse fetchViaMontoya(
             String candidateUrl,
             long responseTimeoutMs,
@@ -1057,35 +1086,9 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
                 .withMethod("GET")
                 .withAddedHeader("Accept", "application/json, application/yaml, text/yaml, */*");
 
-        FutureTask<HttpRequestResponse> requestTask = new FutureTask<>(() -> api.http().sendRequest(specRequest, requestOptions));
-        Thread requestThread = new Thread(requestTask, "openapi-sampler-fetch");
-        requestThread.setDaemon(true);
-        requestThread.start();
-
-        HttpRequestResponse response;
-        try
-        {
-            response = requestTask.get(attemptDeadlineMs, TimeUnit.MILLISECONDS);
-        }
-        catch (TimeoutException timeoutException)
-        {
-            requestTask.cancel(true);
-            throw new IOException("timeout: attempt deadline exceeded (" + attemptDeadlineMs + " ms)", timeoutException);
-        }
-        catch (InterruptedException interruptedException)
-        {
-            Thread.currentThread().interrupt();
-            throw new IOException("timeout: interrupted while waiting for response", interruptedException);
-        }
-        catch (ExecutionException executionException)
-        {
-            Throwable cause = executionException.getCause();
-            if (cause instanceof Exception ex)
-            {
-                throw ex;
-            }
-            throw new IOException("network: " + executionException.getMessage(), executionException);
-        }
+        // The cancellation/deadline wrapper (fetchWithCancellation) runs this on a daemon thread and
+        // enforces the per-attempt deadline, so the request itself only needs the Montoya response timeout.
+        HttpRequestResponse response = api.http().sendRequest(specRequest, requestOptions);
 
         if (response == null || !response.hasResponse() || response.response() == null)
         {
@@ -1118,6 +1121,15 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         {
             return -1L;
         }
+    }
+
+    private boolean isCancellationError(Throwable ex)
+    {
+        if (ex == null)
+        {
+            return false;
+        }
+        return Utils.safeLower(Utils.coalesce(ex.getMessage())).contains("canceled by user");
     }
 
     private boolean isRetryableFetchError(IOException ex)
@@ -1630,7 +1642,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         return origin + normalized;
     }
 
-    private boolean enqueueSpecCandidate(Deque<String> queue, Set<String> seen, String candidate)
+    private boolean enqueueSpecCandidate(Deque<String> queue, Set<String> seen, String candidate, String allowedHost)
     {
         String normalized = normalizeToken(candidate);
         if (!Utils.looksLikeHttpUrl(normalized))
@@ -1642,6 +1654,11 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         {
             URI uri = URI.create(normalized);
             if (Utils.isBlank(uri.getScheme()) || Utils.isBlank(uri.getAuthority()))
+            {
+                return false;
+            }
+            // Never follow spec auto-discovery to a different host than the one the user entered.
+            if (Utils.nonBlank(allowedHost) && !allowedHost.equalsIgnoreCase(uri.getHost()))
             {
                 return false;
             }
@@ -1658,6 +1675,18 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
 
         queue.addLast(normalized);
         return true;
+    }
+
+    private String hostOf(String url)
+    {
+        try
+        {
+            return Utils.coalesce(URI.create(url).getHost());
+        }
+        catch (Exception ignored)
+        {
+            return "";
+        }
     }
 
     private void addCandidate(Set<String> candidates, String candidate)
@@ -1832,6 +1861,13 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
                     if (throwable != null)
                     {
                         Throwable root = unwrap(throwable);
+                        if (isCancellationError(root))
+                        {
+                            progressLabel.setText("Progress: canceled");
+                            statusLabel.setText(actionLabel + " canceled.");
+                            log(actionLabel + " canceled by user.");
+                            return;
+                        }
                         progressLabel.setText("Progress: failed");
                         registerLoadFailure(actionLabel, Utils.coalesce(root.getMessage(), root.getClass().getSimpleName()));
                         logError(actionLabel + " failed: " + root.getMessage(), toException(root));
@@ -1851,7 +1887,6 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         refreshSourceSelector();
         refreshServerSelector();
         applyFilter();
-        autoIncludeSpecHostInScope(outcome.sourceLocation());
 
         int totalCount = model.operations().size();
         int addedCount = Math.max(0, totalCount - previousCount);
@@ -1896,52 +1931,6 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             throw callError.get();
         }
         return addedCount.get();
-    }
-
-    private void autoIncludeSpecHostInScope(String sourceLocation)
-    {
-        if (!Utils.looksLikeHttpUrl(sourceLocation))
-        {
-            return;
-        }
-
-        String scopeTarget = "";
-        try
-        {
-            URI uri = URI.create(sourceLocation);
-            if (Utils.nonBlank(uri.getScheme()) && Utils.nonBlank(uri.getAuthority()))
-            {
-                scopeTarget = uri.getScheme() + "://" + uri.getAuthority() + "/";
-            }
-        }
-        catch (Exception ex)
-        {
-            logError("Unable to parse source location for scope include: " + ex.getMessage(), ex);
-            return;
-        }
-
-        if (Utils.isBlank(scopeTarget))
-        {
-            return;
-        }
-
-        if (isUrlInScope(scopeTarget))
-        {
-            autoIncludedHosts.add(scopeTarget);
-            return;
-        }
-
-        try
-        {
-            includeInScopeOnEdt(scopeTarget);
-            autoIncludedHosts.add(scopeTarget);
-            log("Auto-included spec host in scope: " + scopeTarget);
-        }
-        catch (Exception ex)
-        {
-            autoIncludedHosts.remove(scopeTarget);
-            logError("Failed to auto-include spec host in scope: " + ex.getMessage(), ex);
-        }
     }
 
     private void setLoadingState(boolean loading, String statusText)
@@ -2065,7 +2054,10 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             store.setString(STATE_SOURCE, Utils.coalesce(selectedSourceId()));
             store.setString(STATE_AUTH_TYPE, Utils.coalesce(selectedAuthSelection().id()));
             store.setString(STATE_AUTH_KEY, Utils.coalesce(authKeyField.getText()));
-            store.setString(STATE_AUTH_VALUE, Utils.coalesce(authValueField.getText()));
+            // Never persist the auth secret (Bearer/OAuth2 token, Basic password, API key value): the
+            // extension data store lives in the unencrypted Burp project file. Scrub anything an older
+            // version may have written, and re-prompt the secret each session.
+            store.deleteString(STATE_AUTH_VALUE);
             store.setString(STATE_SOURCES, String.join("\n", persistedSourceLocations()));
         }
         catch (Exception ex)
@@ -2105,7 +2097,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             String authType = Utils.coalesce(store.getString(STATE_AUTH_TYPE));
             selectAuthById(authType);
             authKeyField.setText(Utils.coalesce(store.getString(STATE_AUTH_KEY)));
-            authValueField.setText(Utils.coalesce(store.getString(STATE_AUTH_VALUE)));
+            // The auth secret is intentionally never persisted, so it always starts empty per session.
 
             String sourcesRaw = Utils.coalesce(store.getString(STATE_SOURCES));
             if (Utils.nonBlank(sourcesRaw))
@@ -2256,6 +2248,11 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             }
             catch (Exception ex)
             {
+                if (isCancellationError(ex))
+                {
+                    canceled = true;
+                    break;
+                }
                 failures.add(source + " -> " + Utils.coalesce(ex.getMessage(), ex.getClass().getSimpleName()));
                 registerLoadFailure(source, Utils.coalesce(ex.getMessage(), ex.getClass().getSimpleName()));
             }
@@ -2518,27 +2515,30 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             return;
         }
 
-        int sent = 0;
-        int failed = 0;
-
-        for (OpenApiSamplerModel.OperationContext operation : operations)
-        {
-            try
+        GenerationContext context = generationContextSnapshot();
+        statusLabel.setText("Generating " + operations.size() + " request(s) for Repeater...");
+        submitGenerationTask(() -> {
+            int sent = 0;
+            int failed = 0;
+            for (OpenApiSamplerModel.OperationContext operation : operations)
             {
-                HttpRequest request = generateRequest(operation);
-                String tabName = repeaterTabName("All", operation, request);
-                api.repeater().sendToRepeater(request, tabName);
-                sent++;
+                try
+                {
+                    HttpRequest request = generateRequest(operation, context);
+                    String tabName = repeaterTabName("All", operation, request);
+                    api.repeater().sendToRepeater(request, tabName);
+                    sent++;
+                }
+                catch (Exception ex)
+                {
+                    failed++;
+                    logError("Failed to generate request for " + operation.method() + " " + operation.path() + ": " + ex.getMessage(), ex);
+                }
             }
-            catch (Exception ex)
-            {
-                failed++;
-                logError("Failed to generate request for " + operation.method() + " " + operation.path() + ": " + ex.getMessage(), ex);
-            }
-        }
 
-        statusLabel.setText("Generated " + sent + " request(s), failed: " + failed);
-        log("Visible -> Repeater completed. Sent=" + sent + ", Failed=" + failed);
+            setStatusOnEdt("Generated " + sent + " request(s), failed: " + failed);
+            log("Visible -> Repeater completed. Sent=" + sent + ", Failed=" + failed);
+        });
     }
 
     private void onSelectionAction(OpenApiSamplerTable.SelectionAction action, List<OpenApiSamplerModel.OperationContext> selected)
@@ -2784,26 +2784,30 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
 
     private void sendSelectedToRepeater(List<OpenApiSamplerModel.OperationContext> selected)
     {
-        int sent = 0;
-        int failed = 0;
-        for (OpenApiSamplerModel.OperationContext operation : selected)
-        {
-            try
+        GenerationContext context = generationContextSnapshot();
+        statusLabel.setText("Selected -> Repeater: generating " + selected.size() + " request(s)...");
+        submitGenerationTask(() -> {
+            int sent = 0;
+            int failed = 0;
+            for (OpenApiSamplerModel.OperationContext operation : selected)
             {
-                HttpRequest request = generateRequest(operation);
-                String tabName = repeaterTabName("Selected", operation, request);
-                api.repeater().sendToRepeater(request, tabName);
-                sent++;
+                try
+                {
+                    HttpRequest request = generateRequest(operation, context);
+                    String tabName = repeaterTabName("Selected", operation, request);
+                    api.repeater().sendToRepeater(request, tabName);
+                    sent++;
+                }
+                catch (Exception ex)
+                {
+                    failed++;
+                    logError("Selected -> Repeater failed for " + operation.method() + " " + operation.path() + ": " + ex.getMessage(), ex);
+                }
             }
-            catch (Exception ex)
-            {
-                failed++;
-                logError("Selected -> Repeater failed for " + operation.method() + " " + operation.path() + ": " + ex.getMessage(), ex);
-            }
-        }
 
-        statusLabel.setText("Selected -> Repeater: sent=" + sent + ", failed=" + failed);
-        log("Selected requests sent to Repeater. Sent=" + sent + ", Failed=" + failed);
+            setStatusOnEdt("Selected -> Repeater: sent=" + sent + ", failed=" + failed);
+            log("Selected requests sent to Repeater. Sent=" + sent + ", Failed=" + failed);
+        });
     }
 
     private String repeaterTabName(String bucket, OpenApiSamplerModel.OperationContext operation, HttpRequest request)
@@ -2850,25 +2854,29 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
 
     private void sendSelectedToIntruder(List<OpenApiSamplerModel.OperationContext> selected)
     {
-        int sent = 0;
-        int failed = 0;
-        for (OpenApiSamplerModel.OperationContext operation : selected)
-        {
-            try
+        GenerationContext context = generationContextSnapshot();
+        statusLabel.setText("Selected -> Intruder: generating " + selected.size() + " request(s)...");
+        submitGenerationTask(() -> {
+            int sent = 0;
+            int failed = 0;
+            for (OpenApiSamplerModel.OperationContext operation : selected)
             {
-                HttpRequest request = generateRequest(operation);
-                api.intruder().sendToIntruder(request);
-                sent++;
+                try
+                {
+                    HttpRequest request = generateRequest(operation, context);
+                    api.intruder().sendToIntruder(request);
+                    sent++;
+                }
+                catch (Exception ex)
+                {
+                    failed++;
+                    logError("Selected -> Intruder failed for " + operation.method() + " " + operation.path() + ": " + ex.getMessage(), ex);
+                }
             }
-            catch (Exception ex)
-            {
-                failed++;
-                logError("Selected -> Intruder failed for " + operation.method() + " " + operation.path() + ": " + ex.getMessage(), ex);
-            }
-        }
 
-        statusLabel.setText("Selected -> Intruder: sent=" + sent + ", failed=" + failed);
-        log("Selected requests sent to Intruder. Sent=" + sent + ", Failed=" + failed);
+            setStatusOnEdt("Selected -> Intruder: sent=" + sent + ", failed=" + failed);
+            log("Selected requests sent to Intruder. Sent=" + sent + ", Failed=" + failed);
+        });
     }
 
     private void sendSelectedToAudit(List<OpenApiSamplerModel.OperationContext> selected, boolean active)
@@ -2883,23 +2891,25 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         }
 
         String mode = active ? "Active" : "Passive";
-        String selectedServerSnapshot = selectedServer();
-        RequestGenerator.GenerationOptions options = generationOptionsSnapshot();
+        GenerationContext context = generationContextSnapshot();
         statusLabel.setText(mode + " scan: queuing " + selected.size() + " request(s)...");
-        workerPool.submit(() -> queueSelectedForAudit(selected, active, selectedServerSnapshot, options));
+        workerPool.submit(() -> queueSelectedForAudit(selected, active, context));
     }
 
     private void queueSelectedForAudit(
             List<OpenApiSamplerModel.OperationContext> selected,
             boolean active,
-            String selectedServerSnapshot,
-            RequestGenerator.GenerationOptions options)
+            GenerationContext context)
     {
         String mode = active ? "Active" : "Passive";
         Audit audit;
         try
         {
-            audit = getOrCreateAuditTask(active);
+            // Always start a fresh, known-alive task for each send. The Montoya API gives no way to
+            // detect that the user deleted a scan task in the dashboard (a deleted Audit handle keeps
+            // answering statusMessage()/requestCount() and silently drops addRequest()), so reusing a
+            // cached handle could route requests into a task that no longer exists, with no progress.
+            audit = createAuditTask(active);
         }
         catch (Exception ex)
         {
@@ -2916,7 +2926,6 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
 
         int queued = 0;
         int failed = 0;
-        int autoIncluded = 0;
         int recreated = 0;
         int retried = 0;
         for (OpenApiSamplerModel.OperationContext operation : selected)
@@ -2924,8 +2933,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             HttpRequest request;
             try
             {
-                request = generateRequest(operation, selectedServerSnapshot, options);
-                autoIncluded += autoIncludeRequestHostInScope(request);
+                request = generateRequest(operation, context);
             }
             catch (Exception ex)
             {
@@ -2946,7 +2954,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
                     try
                     {
                         log(mode + " scan task is unavailable. Recreating task and retrying request.");
-                        audit = replaceAuditTask(active);
+                        audit = createAuditTask(active);
                         recreated++;
                         audit.addRequest(request);
                         queued++;
@@ -2968,7 +2976,6 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
 
         int queuedFinal = queued;
         int failedFinal = failed;
-        int autoIncludedFinal = autoIncluded;
         int recreatedFinal = recreated;
         int retriedFinal = retried;
         SwingUtilities.invokeLater(() ->
@@ -2978,26 +2985,8 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
                         + ", retried=" + retriedFinal + "."));
         log(mode + " scan queued for selected operations. Queued=" + queuedFinal
                 + ", Failed=" + failedFinal
-                + ", AutoIncluded=" + autoIncludedFinal
                 + ", Recreated=" + recreatedFinal
                 + ", Retried=" + retriedFinal);
-    }
-
-    private Audit getOrCreateAuditTask(boolean active)
-    {
-        synchronized (auditLock)
-        {
-            Audit cached = active ? activeAuditTask : passiveAuditTask;
-            if (isAuditTaskUsable(cached))
-            {
-                return cached;
-            }
-            if (cached != null)
-            {
-                log((active ? "Active" : "Passive") + " scan task became unavailable. Creating a new task.");
-            }
-            return replaceAuditTaskLocked(active);
-        }
     }
 
     private boolean isAuditTaskUsable(Audit task)
@@ -3018,37 +3007,6 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         }
     }
 
-    private Audit replaceAuditTask(boolean active)
-    {
-        synchronized (auditLock)
-        {
-            return replaceAuditTaskLocked(active);
-        }
-    }
-
-    private Audit replaceAuditTaskLocked(boolean active)
-    {
-        if (active)
-        {
-            activeAuditTask = null;
-        }
-        else
-        {
-            passiveAuditTask = null;
-        }
-
-        Audit created = createAuditTask(active);
-        if (active)
-        {
-            activeAuditTask = created;
-        }
-        else
-        {
-            passiveAuditTask = created;
-        }
-        return created;
-    }
-
     private Audit createAuditTask(boolean active)
     {
         BuiltInAuditConfiguration configuration = active
@@ -3059,161 +3017,84 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         return created;
     }
 
-    private int autoIncludeRequestHostInScope(HttpRequest request)
-    {
-        if (request == null || Utils.isBlank(request.url()) || !Utils.looksLikeHttpUrl(request.url()))
-        {
-            return 0;
-        }
-
-        final String scopeTarget;
-        try
-        {
-            URI uri = URI.create(request.url());
-            if (Utils.isBlank(uri.getScheme()) || Utils.isBlank(uri.getAuthority()))
-            {
-                return 0;
-            }
-            scopeTarget = uri.getScheme() + "://" + uri.getAuthority() + "/";
-        }
-        catch (Exception ex)
-        {
-            logError("Failed to parse request URL for scope include: " + ex.getMessage(), ex);
-            return 0;
-        }
-
-        if (autoIncludedHosts.contains(scopeTarget) || isUrlInScope(scopeTarget))
-        {
-            autoIncludedHosts.add(scopeTarget);
-            return 0;
-        }
-
-        try
-        {
-            includeInScopeOnEdt(scopeTarget);
-            autoIncludedHosts.add(scopeTarget);
-            log("Auto-included request host in scope: " + scopeTarget);
-            return 1;
-        }
-        catch (Exception ex)
-        {
-            logError("Failed to auto-include request host in scope: " + ex.getMessage(), ex);
-            return 0;
-        }
-    }
-
-    private boolean isUrlInScope(String url)
-    {
-        try
-        {
-            if (Utils.isBlank(url))
-            {
-                return false;
-            }
-            return api.scope().isInScope(url);
-        }
-        catch (Exception ex)
-        {
-            logError("Failed to check scope state for scanner request: " + ex.getMessage(), ex);
-            return false;
-        }
-    }
-
-    private void includeInScopeOnEdt(String scopeTarget) throws Exception
-    {
-        if (Utils.isBlank(scopeTarget))
-        {
-            return;
-        }
-        if (SwingUtilities.isEventDispatchThread())
-        {
-            api.scope().includeInScope(scopeTarget);
-            return;
-        }
-
-        AtomicReference<Exception> callError = new AtomicReference<>();
-        SwingUtilities.invokeAndWait(() -> {
-            try
-            {
-                api.scope().includeInScope(scopeTarget);
-            }
-            catch (Exception ex)
-            {
-                callError.set(ex);
-            }
-        });
-        if (callError.get() != null)
-        {
-            throw callError.get();
-        }
-    }
-
     private void copySelectedAsCurl(List<OpenApiSamplerModel.OperationContext> selected)
     {
-        StringBuilder all = new StringBuilder();
-        int copied = 0;
-        int failed = 0;
+        GenerationContext context = generationContextSnapshot();
+        statusLabel.setText("Generating cURL for " + selected.size() + " selected operation(s)...");
+        submitGenerationTask(() -> {
+            StringBuilder all = new StringBuilder();
+            int copied = 0;
+            int failed = 0;
 
-        for (OpenApiSamplerModel.OperationContext operation : selected)
-        {
-            try
+            for (OpenApiSamplerModel.OperationContext operation : selected)
             {
-                HttpRequest request = generateRequest(operation);
-                if (all.length() > 0)
+                try
                 {
-                    all.append("\n\n# ----------------------------------------\n\n");
+                    HttpRequest request = generateRequest(operation, context);
+                    if (all.length() > 0)
+                    {
+                        all.append("\n\n# ----------------------------------------\n\n");
+                    }
+                    all.append("# ").append(operation.method()).append(' ').append(operation.path()).append('\n');
+                    all.append(Utils.toCurl(request));
+                    copied++;
                 }
-                all.append("# ").append(operation.method()).append(' ').append(operation.path()).append('\n');
-                all.append(Utils.toCurl(request));
-                copied++;
+                catch (Exception ex)
+                {
+                    failed++;
+                    logError("Copy cURL failed for " + operation.method() + " " + operation.path() + ": " + ex.getMessage(), ex);
+                }
             }
-            catch (Exception ex)
-            {
-                failed++;
-                logError("Copy cURL failed for " + operation.method() + " " + operation.path() + ": " + ex.getMessage(), ex);
-            }
-        }
 
-        if (copied > 0)
-        {
-            Utils.copyToClipboard(all.toString());
-            statusLabel.setText("Copied cURL for " + copied + " selected operation(s), failed: " + failed);
-            log("Copied selected as cURL. Copied=" + copied + ", Failed=" + failed);
-        }
+            finishClipboardCopy(all.toString(), copied, failed, "cURL");
+        });
     }
 
     private void copySelectedAsPython(List<OpenApiSamplerModel.OperationContext> selected)
     {
-        StringBuilder all = new StringBuilder();
-        int copied = 0;
-        int failed = 0;
+        GenerationContext context = generationContextSnapshot();
+        statusLabel.setText("Generating Python requests for " + selected.size() + " selected operation(s)...");
+        submitGenerationTask(() -> {
+            StringBuilder all = new StringBuilder();
+            int copied = 0;
+            int failed = 0;
 
-        for (OpenApiSamplerModel.OperationContext operation : selected)
-        {
-            try
+            for (OpenApiSamplerModel.OperationContext operation : selected)
             {
-                HttpRequest request = generateRequest(operation);
-                if (all.length() > 0)
+                try
                 {
-                    all.append("\n\n# ========================================\n\n");
+                    HttpRequest request = generateRequest(operation, context);
+                    if (all.length() > 0)
+                    {
+                        all.append("\n\n# ========================================\n\n");
+                    }
+                    all.append("# ").append(operation.method()).append(' ').append(operation.path()).append('\n');
+                    all.append(Utils.toPythonRequests(request));
+                    copied++;
                 }
-                all.append("# ").append(operation.method()).append(' ').append(operation.path()).append('\n');
-                all.append(Utils.toPythonRequests(request));
-                copied++;
+                catch (Exception ex)
+                {
+                    failed++;
+                    logError("Copy Python failed for " + operation.method() + " " + operation.path() + ": " + ex.getMessage(), ex);
+                }
             }
-            catch (Exception ex)
-            {
-                failed++;
-                logError("Copy Python failed for " + operation.method() + " " + operation.path() + ": " + ex.getMessage(), ex);
-            }
-        }
 
-        if (copied > 0)
+            finishClipboardCopy(all.toString(), copied, failed, "Python");
+        });
+    }
+
+    private void finishClipboardCopy(String content, int copied, int failed, String label)
+    {
+        if (copied <= 0)
         {
-            Utils.copyToClipboard(all.toString());
-            statusLabel.setText("Copied Python for " + copied + " selected operation(s), failed: " + failed);
-            log("Copied selected as Python requests. Copied=" + copied + ", Failed=" + failed);
+            setStatusOnEdt("Copied " + label + " for 0 selected operation(s), failed: " + failed);
+            return;
         }
+        SwingUtilities.invokeLater(() -> {
+            Utils.copyToClipboard(content);
+            statusLabel.setText("Copied " + label + " for " + copied + " selected operation(s), failed: " + failed);
+        });
+        log("Copied selected as " + label + ". Copied=" + copied + ", Failed=" + failed);
     }
 
     private void exportSelectedRequests(List<OpenApiSamplerModel.OperationContext> selected)
@@ -3229,38 +3110,49 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         }
 
         Path outputPath = chooser.getSelectedFile().toPath();
-        ExportDocument exportDocument;
-        try
-        {
-            exportDocument = buildExportDocument(selected);
-            if (Utils.isBlank(exportDocument.content()))
+        GenerationContext context = generationContextSnapshot();
+        statusLabel.setText("Exporting " + selected.size() + " request(s)...");
+        submitGenerationTask(() -> {
+            ExportDocument exportDocument;
+            try
             {
-                showError("Export error", "No requests were exported.");
+                exportDocument = buildExportDocument(selected, context);
+                if (Utils.isBlank(exportDocument.content()))
+                {
+                    setStatusOnEdt("Export produced no requests.");
+                    showError("Export error", "No requests were exported.");
+                    return;
+                }
+                Files.writeString(
+                        outputPath,
+                        exportDocument.content(),
+                        StandardCharsets.UTF_8,
+                        StandardOpenOption.CREATE,
+                        StandardOpenOption.TRUNCATE_EXISTING,
+                        StandardOpenOption.WRITE
+                );
+            }
+            catch (Exception ex)
+            {
+                logError("Export failed: " + ex.getMessage(), ex);
+                setStatusOnEdt("Export failed.");
+                showError("Export error", ex.getMessage());
                 return;
             }
-            Files.writeString(
-                    outputPath,
-                    exportDocument.content(),
-                    StandardCharsets.UTF_8,
-                    StandardOpenOption.CREATE,
-                    StandardOpenOption.TRUNCATE_EXISTING,
-                    StandardOpenOption.WRITE
-            );
-        }
-        catch (Exception ex)
-        {
-            logError("Export failed: " + ex.getMessage(), ex);
-            showError("Export error", ex.getMessage());
-            return;
-        }
 
-        int exported = exportDocument.exported();
-        int failed = exportDocument.failed();
-        statusLabel.setText("Exported " + exported + " request(s), failed: " + failed + " -> " + outputPath);
-        log("Exported selected requests. Exported=" + exported + ", Failed=" + failed + ", File=" + outputPath);
+            int exported = exportDocument.exported();
+            int failed = exportDocument.failed();
+            setStatusOnEdt("Exported " + exported + " request(s), failed: " + failed + " -> " + outputPath);
+            log("Exported selected requests. Exported=" + exported + ", Failed=" + failed + ", File=" + outputPath);
+        });
     }
 
     private ExportDocument buildExportDocument(List<OpenApiSamplerModel.OperationContext> selected)
+    {
+        return buildExportDocument(selected, generationContextSnapshot());
+    }
+
+    private ExportDocument buildExportDocument(List<OpenApiSamplerModel.OperationContext> selected, GenerationContext context)
     {
         if (selected == null || selected.isEmpty())
         {
@@ -3275,7 +3167,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
             HttpRequest request;
             try
             {
-                request = generateRequest(operation);
+                request = generateRequest(operation, context);
             }
             catch (Exception ex)
             {
@@ -3469,25 +3361,40 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
         return new RequestGenerator.GenerationOptions(selectedAuthProfile());
     }
 
+    /**
+     * Immutable snapshot of the UI-derived inputs needed to generate requests. Captured on the EDT so
+     * that request generation (which can be heavy for large/complex specs) runs on a worker thread
+     * without touching or blocking Swing.
+     */
+    private record GenerationContext(String server, String sourceId, RequestGenerator.GenerationOptions options)
+    {
+    }
+
+    private GenerationContext generationContextSnapshot()
+    {
+        return new GenerationContext(selectedServer(), selectedSourceId(), generationOptionsSnapshot());
+    }
+
     private HttpRequest generateRequest(OpenApiSamplerModel.OperationContext operationContext)
     {
-        return generateRequest(operationContext, selectedServer(), generationOptionsSnapshot());
+        return generateRequest(operationContext, generationContextSnapshot());
     }
 
     private HttpRequest generateRequest(
             OpenApiSamplerModel.OperationContext operationContext,
-            String selectedServerSnapshot,
-            RequestGenerator.GenerationOptions options)
+            GenerationContext context)
     {
         return requestGenerator.generate(
                 operationContext,
-                selectedServerSnapshot,
-                fallbackServersForOperation(operationContext),
-                options
+                context.server(),
+                fallbackServersForOperation(operationContext, context.sourceId()),
+                context.options()
         );
     }
 
-    private List<String> fallbackServersForOperation(OpenApiSamplerModel.OperationContext operationContext)
+    private List<String> fallbackServersForOperation(
+            OpenApiSamplerModel.OperationContext operationContext,
+            String selectedSourceIdSnapshot)
     {
         if (operationContext != null && Utils.nonBlank(operationContext.sourceId()))
         {
@@ -3497,7 +3404,7 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
                 return bySource;
             }
         }
-        return model.availableServers(selectedSourceId());
+        return model.availableServers(selectedSourceIdSnapshot);
     }
 
     private String extractRequestUrl(HttpRequestResponse requestResponse)
@@ -3531,6 +3438,33 @@ public final class OpenApiSamplerTab implements ContextMenuItemsProvider
     private void showError(String title, String message)
     {
         SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(dialogParent(), message, title, JOptionPane.ERROR_MESSAGE));
+    }
+
+    private void setStatusOnEdt(String text)
+    {
+        SwingUtilities.invokeLater(() -> statusLabel.setText(text));
+    }
+
+    /**
+     * Runs request generation (and the follow-up Repeater/Intruder/clipboard/export work) on the worker
+     * pool so the Swing EDT is never blocked while sampling a potentially large selection.
+     */
+    private void submitGenerationTask(Runnable backgroundWork)
+    {
+        if (disposed.get())
+        {
+            return;
+        }
+        workerPool.submit(() -> {
+            try
+            {
+                backgroundWork.run();
+            }
+            catch (Exception ex)
+            {
+                logError("Background generation task failed: " + ex.getMessage(), ex);
+            }
+        });
     }
 
     private Component dialogParent()

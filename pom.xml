@@ -16,7 +16,7 @@
         <!-- Versions validated against Maven Central as of 2026 -->
         <montoya.api.version>2026.2</montoya.api.version>
         <swagger.parser.v3.version>2.1.37</swagger.parser.v3.version>
-        <jackson.databind.version>2.18.4</jackson.databind.version>
+        <jackson.databind.version>2.22.0</jackson.databind.version>
         <json.version>20250517</json.version>
         <juniversalchardet.version>1.0.3</juniversalchardet.version>
         <junit.jupiter.version>5.11.4</junit.jupiter.version>
